@@ -60,11 +60,10 @@ def team_side(tag_value):
     return None
 
 
-def set_piece_clues(n_frames: int) -> tuple:
-    """Scores from set pieces and goals, plus counts of what was used."""
+def set_piece_clues(n_frames: int, tags: list) -> tuple:
+    """Scores from set pieces: dead before the restart, restarting team after it."""
     score = np.zeros((n_frames, 3))
-    counts = {"set pieces": 0, "with team": 0, "goal stoppages": 0}
-    tags = load_tags()
+    counts = {"set pieces": 0, "with team": 0}
 
     for tag in tags:
         if _norm(tag["code"]) != "set pieces" or _norm(tag["tags"].get("Type")) not in SET_PIECE_TYPES:
@@ -78,7 +77,13 @@ def set_piece_clues(n_frames: int) -> tuple:
         if side is not None:
             score[middle:min(n_frames, end + int(AFTER_TAG_S * FPS)), side] += RESTART_TEAM_CLUE
             counts["with team"] += 1
+    return score, counts
 
+
+def goal_clues(n_frames: int, tags: list) -> tuple:
+    """Dead from each GOALS tag's end to the next "Kick Off (After Goal)", if within range."""
+    score = np.zeros((n_frames, 3))
+    paired = 0
     goals = sorted(t["end_frame"] for t in tags if _norm(t["code"]) == "goals")
     kickoffs = sorted(t["start_frame"] for t in tags
                       if _norm(t["tags"].get("Type")) == "kick off (after goal)")
@@ -86,8 +91,8 @@ def set_piece_clues(n_frames: int) -> tuple:
         later = [k for k in kickoffs if goal < k <= goal + GOAL_TO_KICKOFF_MAX_S * FPS]
         if later:
             score[goal:later[0], D] += GOAL_DEAD_CLUE
-            counts["goal stoppages"] += 1
-    return score, counts
+            paired += 1
+    return score, paired
 
 
 def vanish_clues(t: dict) -> tuple:
@@ -112,9 +117,11 @@ def vanish_clues(t: dict) -> tuple:
 def label_match(t: dict) -> tuple:
     """Labels for every frame, plus diagnostics for the report."""
     score, signals = v1.clues(t)
-    sp_score, sp_counts = set_piece_clues(len(score))
+    tags = load_tags()
+    sp_score, sp_counts = set_piece_clues(len(score), tags)
+    goal_score, sp_counts["goal stoppages"] = goal_clues(len(score), tags)
     vn_score, vanished = vanish_clues(t)
-    labels = v1.decode_halves(score + sp_score + vn_score)
+    labels = v1.decode_halves(score + sp_score + goal_score + vn_score)
     return labels, sp_counts, vanished, signals["speed"]
 
 
