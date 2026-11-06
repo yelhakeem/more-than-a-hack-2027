@@ -1,25 +1,13 @@
-"""Load the tracking data once, save a fast copy, and print a summary.
+"""Load the tactical tracking into numpy arrays, cached for fast reuse.
 
-What this file does, in plain words:
+Usage:
+    python solution/tracking.py            # build the cache if needed, print a summary
+    python solution/tracking.py --rebuild  # force a re-parse of the raw file
 
-  1. Reads the big tracking text file (one line per video frame) and turns it into tables of
-     numbers: where every tracked player is, which team they belong to, and where the ball is.
-  2. Saves those tables to data/cache/tracking.npz. Reading the text file takes a minute or two;
-     reading the saved copy takes about a second, so every later script starts fast.
-     The cache lives inside data/, which git ignores, so it never ends up in the public repo.
-  3. Prints only summary numbers (percentages and averages), never raw positions.
-
-Run it from the project folder:
-
-    python solution/tracking.py
-
-Other scripts use it like this:
-
-    from tracking import load_tracking
-    t = load_tracking()
-    t["ball_x"][frame]      # ball position in metres along the pitch, NaN if not seen
+The cache lives in data/cache/, which git ignores. The summary prints aggregates only.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -27,50 +15,42 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from games import DATA_DIR, GAME, GAMES, half_video_blocks, require, source_frames  # noqa: E402
 
 CACHE_PATH = os.path.join(DATA_DIR, "cache", "tracking.npz")
 CACHE_VERSION = 1
-
+FPS = 25
 HOME, AWAY = 0, 1
 
 
-def track_teams(meta_path):
-    """For each track slot, 0 if it belongs to the home team (Barcelona), 1 if away."""
+def track_teams(meta_path: str) -> np.ndarray:
+    """Team of each track slot (HOME or AWAY). The first team in the metadata is home."""
     root = ET.parse(meta_path).getroot()
     team_ids = [team.get("id") for team in root.iter("Team")]
     if len(team_ids) != 2:
-        raise ValueError("expected 2 teams in {}, found {}".format(meta_path, len(team_ids)))
-    home_id = team_ids[0]  # the first team listed is the home side (FIFA/EPTS convention)
+        raise ValueError(f"expected 2 teams in {meta_path}, found {len(team_ids)}")
     slots = [player.get("teamId") for player in root.iter("Player")]
-    return np.array([HOME if t == home_id else AWAY for t in slots], dtype=np.int8)
+    return np.array([HOME if t == team_ids[0] else AWAY for t in slots], dtype=np.int8)
 
 
-def _xy(group):
-    """'x,y,speed' -> (x, y, speed) as floats. 'NaN' becomes nan automatically."""
+def _parse_group(group: str) -> tuple:
+    """'x,y,speed' -> floats; 'NaN' parses to nan."""
     parts = group.split(",")
     speed = float(parts[2]) if len(parts) > 2 and parts[2] else np.nan
     return float(parts[0]), float(parts[1]), speed
 
 
-def parse_raw(raw_path, n_slots, n_frames, pitch):
-    """Read the raw tracking file into arrays, one row per VIDEO frame.
+def parse_raw(raw_path: str, n_slots: int, n_frames: int, pitch: tuple) -> dict:
+    """Parse '<frame_id>:<player>;...:<ball>' lines into arrays indexed by video frame.
 
-    Each line looks like  <frame_id>:<player>;<player>;...:<ball>  and each group is x,y,speed.
-    frame_id counts from 1, video frames from 0, so row = frame_id - 1.
-    Positions arrive as 0-1 fractions of the pitch; we convert them to metres so that distances
-    are real distances (the pitch is longer than it is wide).
+    Positions are converted from 0-1 pitch fractions to metres; video frame = frame_id - 1.
     """
     length, width = pitch
-    px = np.full((n_frames, n_slots), np.nan, dtype=np.float32)
-    py = np.full((n_frames, n_slots), np.nan, dtype=np.float32)
-    ps = np.full((n_frames, n_slots), np.nan, dtype=np.float32)
-    bx = np.full(n_frames, np.nan, dtype=np.float32)
-    by = np.full(n_frames, np.nan, dtype=np.float32)
-    bs = np.full(n_frames, np.nan, dtype=np.float32)
+    shape = (n_frames, n_slots)
+    px, py, ps = (np.full(shape, np.nan, dtype=np.float32) for _ in range(3))
+    bx, by, bs = (np.full(n_frames, np.nan, dtype=np.float32) for _ in range(3))
 
     with open(raw_path) as handle:
         for line in handle:
@@ -81,24 +61,21 @@ def parse_raw(raw_path, n_slots, n_frames, pitch):
             if not 0 <= row < n_frames:
                 continue
             for slot, group in enumerate(parts[1].split(";")):
-                if slot >= n_slots or not group or group[0] == "N":
-                    continue
-                x, y, s = _xy(group)
-                px[row, slot], py[row, slot], ps[row, slot] = x * length, y * width, s
+                if slot < n_slots and group and group[0] != "N":
+                    x, y, s = _parse_group(group)
+                    px[row, slot], py[row, slot], ps[row, slot] = x * length, y * width, s
             if parts[2] and parts[2][0] != "N":
-                x, y, s = _xy(parts[2])
+                x, y, s = _parse_group(parts[2])
                 bx[row], by[row], bs[row] = x * length, y * width, s
-    return px, py, ps, bx, by, bs
+
+    return dict(px=px, py=py, ps=ps, bx=bx, by=by, bs=bs)
 
 
-def load_tracking(rebuild=False):
-    """The tracking as a dict of numpy arrays, built from the raw file the first time only.
+def load_tracking(rebuild: bool = False) -> dict:
+    """Tracking arrays, from the cache when available.
 
-    Keys: px, py, ps   players' x, y (metres) and speed (m/s); shape (frames, slots)
-          bx, by, bs   ball x, y (metres) and speed; shape (frames,)
-          team         team of each slot: 0 home, 1 away
-          pitch        (length, width) in metres
-    Missing observations are NaN.
+    Keys: px, py, ps (frames x slots: metres, metres, m/s); bx, by, bs (frames);
+    team (slots: HOME/AWAY); pitch (length, width in metres). Missing values are NaN.
     """
     if not rebuild and os.path.isfile(CACHE_PATH):
         cached = dict(np.load(CACHE_PATH))
@@ -108,71 +85,73 @@ def load_tracking(rebuild=False):
     meta_path, raw_path = require(["atd_meta", "atd_raw"])
     team = track_teams(meta_path)
     pitch = GAMES[GAME]["pitch"]
-    print("Reading {} (takes a minute or two, only the first time) ...".format(
-        os.path.basename(raw_path)))
-    start = time.time()
-    px, py, ps, bx, by, bs = parse_raw(raw_path, len(team), source_frames(), pitch)
-    print("  done in {:.0f} s".format(time.time() - start))
 
-    data = dict(px=px, py=py, ps=ps, bx=bx, by=by, bs=bs, team=team,
-                pitch=np.array(pitch, dtype=np.float32), version=np.array(CACHE_VERSION))
+    print(f"Parsing {os.path.basename(raw_path)} (first run only) ...")
+    start = time.time()
+    data = parse_raw(raw_path, len(team), source_frames(), pitch)
+    print(f"  done in {time.time() - start:.0f} s")
+
+    data.update(team=team, pitch=np.array(pitch, dtype=np.float32),
+                version=np.array(CACHE_VERSION))
     os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
     np.savez(CACHE_PATH, **data)
-    print("  saved fast copy to {}".format(os.path.relpath(CACHE_PATH, ROOT)))
+    print(f"  cached to {os.path.relpath(CACHE_PATH, ROOT)}")
     return data
 
 
-def graded_mask(n_frames):
-    """True on the frames that are scored (the two halves), False elsewhere."""
+def graded_mask(n_frames: int) -> np.ndarray:
+    """True on frames inside the two graded halves."""
     mask = np.zeros(n_frames, dtype=bool)
     for _, first, last in half_video_blocks(GAME):
         mask[first:last + 1] = True
     return mask
 
 
-def summary(t):
-    """Print summary numbers only -- safe to share. Never prints positions."""
-    n_frames = len(t["bx"])
-    graded = graded_mask(n_frames)
-    length, width = [float(v) for v in t["pitch"]]
+def run_lengths(flags: np.ndarray) -> np.ndarray:
+    """Lengths of consecutive True runs."""
+    padded = np.concatenate(([0], flags.astype(np.int8), [0]))
+    edges = np.flatnonzero(np.diff(padded))
+    return edges[1::2] - edges[::2]
+
+
+def summary(t: dict) -> None:
+    """Print aggregate statistics over graded frames. No positions are printed."""
+    graded = graded_mask(len(t["bx"]))
+    length, width = (float(v) for v in t["pitch"])
     ball_seen = ~np.isnan(t["bx"])
-    seen_players = ~np.isnan(t["px"])
-    home_slots = t["team"] == HOME
+    players_seen = ~np.isnan(t["px"])
+    home = t["team"] == HOME
 
-    print("\nSUMMARY (graded frames only, {:,} frames)".format(int(graded.sum())))
-    print("  track slots in metadata:        {} ({} home, {} away)".format(
-        len(t["team"]), int(home_slots.sum()), int((~home_slots).sum())))
-    print("  ball seen:                      {:.1f}%  (DATA.md says 59.3%)".format(
-        100 * ball_seen[graded].mean()))
-    per_frame = seen_players[graded].sum(axis=1)
-    print("  players tracked per frame:      {:.1f} on average  (DATA.md says 20.5)".format(
-        per_frame.mean()))
-    print("    home / away:                  {:.1f} / {:.1f}".format(
-        seen_players[graded][:, home_slots].sum(axis=1).mean(),
-        seen_players[graded][:, ~home_slots].sum(axis=1).mean()))
-    print("  frames with fewer than 15:      {:.1f}%".format(100 * (per_frame < 15).mean()))
-
+    per_frame = players_seen[graded].sum(axis=1)
     seen = graded & ball_seen
     off = seen & ((t["bx"] < 0) | (t["bx"] > length) | (t["by"] < 0) | (t["by"] > width))
-    print("  ball seen OFF the pitch:        {:.1f}% of frames where it is seen".format(
-        100 * off.sum() / max(seen.sum(), 1)))
+    gaps = run_lengths(~ball_seen[graded])
+    if gaps.size == 0:
+        gaps = np.array([0])
 
-    # How long does the ball stay missing? Long gaps are where guessing gets hard.
-    gaps, run = [], 0
-    for missing in ~ball_seen[graded]:
-        if missing:
-            run += 1
-        elif run:
-            gaps.append(run)
-            run = 0
-    if run:
-        gaps.append(run)
-    gaps = np.array(gaps) if gaps else np.array([0])
-    print("  ball-missing stretches:         {:,}".format(len(gaps)))
-    print("    median / 90th pct / longest:  {:.1f} s / {:.1f} s / {:.1f} s".format(
-        np.median(gaps) / 25, np.percentile(gaps, 90) / 25, gaps.max() / 25))
-    print("    share over 2 seconds:         {:.1f}%".format(100 * (gaps > 50).mean()))
+    print(f"\nSUMMARY (graded frames only, {int(graded.sum()):,} frames)")
+    print(f"  track slots in metadata:        {len(home)} ({int(home.sum())} home, "
+          f"{int((~home).sum())} away)")
+    print(f"  ball seen:                      {100 * ball_seen[graded].mean():.1f}%  "
+          f"(DATA.md says 59.3%)")
+    print(f"  players tracked per frame:      {per_frame.mean():.1f} on average  "
+          f"(DATA.md says 20.5)")
+    print(f"    home / away:                  {players_seen[graded][:, home].sum(axis=1).mean():.1f}"
+          f" / {players_seen[graded][:, ~home].sum(axis=1).mean():.1f}")
+    print(f"  frames with fewer than 15:      {100 * (per_frame < 15).mean():.1f}%")
+    print(f"  ball seen OFF the pitch:        {100 * off.sum() / max(seen.sum(), 1):.1f}% "
+          f"of frames where it is seen")
+    print(f"  ball-missing stretches:         {len(gaps):,}")
+    print(f"    median / 90th pct / longest:  {np.median(gaps) / FPS:.1f} s / "
+          f"{np.percentile(gaps, 90) / FPS:.1f} s / {gaps.max() / FPS:.1f} s")
+    print(f"    share over 2 seconds:         {100 * (gaps > 2 * FPS).mean():.1f}%")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--rebuild", action="store_true", help="re-parse the raw tracking file")
+    summary(load_tracking(rebuild=parser.parse_args().rebuild))
 
 
 if __name__ == "__main__":
-    summary(load_tracking(rebuild="--rebuild" in sys.argv))
+    main()
