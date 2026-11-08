@@ -35,9 +35,19 @@ MATCHES = ("J03WMX", "J03WN1", "J03WPY", "J03WOH", "J03WQQ", "J03WOY", "J03WR9")
 H, A, D = 0, 1, 2
 
 # Degrading the clean stadium tracking so it looks like tracking from a single tactical video.
-# DATA.md documents our match: ball seen 59.3% of graded frames, 20.5 of 22 players tracked.
-BALL_MISSING_SHARES = (0.30, 0.40, 0.50)      # around the documented 40.7% missing
-BALL_GAP_MEANS_S = (1.0, 2.5)                 # short and long gaps, both used
+# Targets are label-free statistics of our match's tracking (python solution/tracking.py;
+# the first two are also published in DATA.md):
+#   ball seen 59.3% of graded frames         -> 40.7% missing
+#   ball-missing stretches: median 10.7 s, 90th percentile 33.8 s, longest 221.5 s
+#   ball seen off the pitch on 4.2% of the frames where it is seen
+#   players tracked: 20.5 of 22 on average
+BALL_MISSING_SHARE = 0.407
+BALL_MISSING_SHARES = (0.35, 0.407, 0.45)     # training varies around it a little
+GAP_MEDIAN_S, GAP_P90_S, GAP_MAX_S, GAP_MIN_S = 10.7, 33.8, 221.5, 0.2
+GAP_SIGMA = float(np.log(GAP_P90_S / GAP_MEDIAN_S) / 1.2816)   # lognormal through median and p90
+OFF_SEEN_SHARE = 0.042
+EXIT_LEAD_S = 2.0                              # a gap anchored to a ball exit starts up to 2 s before it
+ANCHOR_SHARES = tuple(np.linspace(0, 1, 11))   # tried in turn to match OFF_SEEN_SHARE
 PLAYER_MISSING_SHARE = 1 - 20.5 / 22           # ~7% of player-frames
 PLAYER_GAP_MEAN_S = 3.0
 
@@ -123,7 +133,7 @@ def load_match(match_id: str) -> dict:
 
 
 def _gaps(n: int, missing_share: float, gap_mean: float, rng: np.random.Generator) -> np.ndarray:
-    """Boolean mask of missing frames: alternating seen / missing stretches of random length."""
+    """Player-track gaps: alternating seen / missing stretches of random length."""
     seen_mean = gap_mean * (1 - missing_share) / missing_share
     mask = np.zeros(n, dtype=bool)
     i, missing = 0, bool(rng.random() < missing_share)
@@ -136,14 +146,54 @@ def _gaps(n: int, missing_share: float, gap_mean: float, rng: np.random.Generato
     return mask
 
 
-def degrade(t: dict, rng: np.random.Generator, missing_share: float = None,
-            gap_mean_s: float = None) -> dict:
-    """Copy of a clean match with ball and player gaps like single-video tracking."""
+def ball_off(t: dict) -> np.ndarray:
+    """Ball outside the pitch lines (same test as tracking.py's summary)."""
+    length, width = (float(v) for v in t["pitch"])
+    x, y = t["bx"], t["by"]
+    return (x < 0) | (x > length) | (y < 0) | (y > width)
+
+
+def _ball_gaps(n: int, share: float, exits: np.ndarray, anchor: float,
+               rng: np.random.Generator) -> np.ndarray:
+    """Missing-ball mask: lognormal gap lengths like our video's, some starting at ball exits."""
+    mask = np.zeros(n, dtype=bool)
+    mu = np.log(GAP_MEDIAN_S * FPS)
+    lo, hi = int(GAP_MIN_S * FPS), int(GAP_MAX_S * FPS)
+    lead = int(EXIT_LEAD_S * FPS)
+    while mask.mean() < share:
+        length = int(np.clip(rng.lognormal(mu, GAP_SIGMA), lo, hi))
+        if exits.size and rng.random() < anchor:
+            start = int(rng.choice(exits)) - int(rng.integers(0, lead + 1))
+        else:
+            start = int(rng.integers(0, n))
+        mask[max(0, start):start + length] = True
+    return mask
+
+
+def degrade(t: dict, rng: np.random.Generator, missing_share: float = None) -> dict:
+    """Copy of a clean match with ball and player gaps like our tactical-video tracking.
+
+    The share of gaps that start where the ball leaves the pitch is chosen so the ball is seen
+    off the pitch about as often as in our match (OFF_SEEN_SHARE): in a single video the
+    camera usually loses a ball that goes out.
+    """
     out = dict(t)
     n = len(t["bx"])
     share = missing_share if missing_share is not None else float(rng.choice(BALL_MISSING_SHARES))
-    gap = gap_mean_s if gap_mean_s is not None else float(rng.choice(BALL_GAP_MEANS_S))
-    lost = _gaps(n, share, gap, rng)
+    off = ball_off(t)
+    exits = np.flatnonzero(off[1:] & ~off[:-1]) + 1
+    best = None
+    for anchor in ANCHOR_SHARES:
+        trial_rng = np.random.default_rng(rng.integers(2 ** 32))
+        lost = _ball_gaps(n, share, exits, anchor, trial_rng)
+        seen = ~lost
+        off_seen = float(off[seen].mean()) if seen.any() else 0.0
+        if best is None or abs(off_seen - OFF_SEEN_SHARE) < best[0]:
+            best = (abs(off_seen - OFF_SEEN_SHARE), lost, anchor, off_seen)
+        if off_seen <= OFF_SEEN_SHARE:
+            break                                   # more anchoring only hides more off-pitch balls
+    _, lost, anchor, off_seen = best
+    out["degrade_info"] = np.array([share, anchor, off_seen, lost.mean()])
     out["bx"], out["by"] = t["bx"].copy(), t["by"].copy()
     out["bx"][lost] = np.nan
     out["by"][lost] = np.nan

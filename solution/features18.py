@@ -72,7 +72,7 @@ def _ball_speed(bx: np.ndarray, by: np.ndarray, span: int = 2) -> np.ndarray:
     return s
 
 
-def _segment_block(t: dict, a: int, b: int) -> dict:
+def _segment_block(t: dict, a: int, b: int, cap_s: float = CAP_S) -> dict:
     """All features for one half, from the home team's side."""
     length, width = (float(v) for v in t["pitch"])
     home = t["team"] == HOME
@@ -102,7 +102,7 @@ def _segment_block(t: dict, a: int, b: int) -> dict:
         f["n_home_near"] = np.where(seen, np.sum(dist[:, home] <= NEAR_M, axis=1), np.nan)
         f["n_away_near"] = np.where(seen, np.sum(dist[:, ~home] <= NEAR_M, axis=1), np.nan)
 
-        cap = int(CAP_S * FPS)
+        cap = int(cap_s * FPS)
         rev = slice(None, None, -1)
         f["since_seen"] = _since(seen, cap) / FPS
         f["until_seen"] = _since(seen[rev], cap)[rev] / FPS
@@ -145,10 +145,10 @@ def _segment_block(t: dict, a: int, b: int) -> dict:
     return f
 
 
-def build(t: dict, segments) -> tuple:
+def build(t: dict, segments, cap_s: float = CAP_S) -> tuple:
     """Feature matrix (frames x features, NaN outside the segments) and feature names."""
     n = len(t["bx"])
-    blocks = [(a, b, _segment_block(t, a, b)) for a, b in segments]
+    blocks = [(a, b, _segment_block(t, a, b, cap_s)) for a, b in segments]
     names = list(blocks[0][2])
     X = np.full((n, len(names)), np.nan, dtype=np.float32)
     for a, b, f in blocks:
