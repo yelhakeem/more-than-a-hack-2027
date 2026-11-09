@@ -217,6 +217,46 @@ def swap_teams(t: dict) -> dict:
     return out
 
 
+EVENT_KINDS = (("throwin", "Throw-in"), ("cornerkick", "Corner Kick"), ("goalkick", "Goal Kick"),
+               ("freekick", "Free Kick"), ("kickoff", "Kick Off"))
+
+
+def load_events(match_id: str) -> list:
+    """Restart events of one DFL match: [(frame, kind, team)], team H / A, frames as in load_match.
+
+    Read with floodlight from the already downloaded files; cached as JSON in data/external/.
+    """
+    import json
+
+    path = os.path.join(CACHE_DIR, f"{match_id}_events.json")
+    if os.path.isfile(path):
+        with open(path) as handle:
+            return [tuple(e) for e in json.load(handle)]
+    from floodlight.io.datasets import IDSSEDataset   # only needed here
+
+    segments = load_match(match_id)["segments"]
+    events, *_ = IDSSEDataset(match_id=match_id).get(match_id, events=True, positions=False)
+    out = []
+    for index, half in enumerate(events):
+        seg_start = int(segments[index][0])
+        for group, obj in events[half].items():
+            team = H if "home" in str(group).lower() else A if "away" in str(group).lower() else None
+            df = obj.events
+            if "gameclock" not in df.columns or "eID" not in df.columns:
+                raise ValueError(f"{match_id}: event columns are {list(df.columns)}")
+            for eid, clock in zip(df["eID"].astype(str), df["gameclock"].astype(float)):
+                key = "".join(ch for ch in eid.lower() if ch.isalpha())
+                for word, kind in EVENT_KINDS:
+                    if word in key and team is not None and np.isfinite(clock):
+                        out.append((seg_start + int(round(clock * FPS)), kind, int(team)))
+                        break
+    out.sort()
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(out, handle)
+    return out
+
+
 def main() -> None:
     print("DFL OPEN DATA (external, CC BY 4.0)")
     for match_id in MATCHES:
