@@ -1,0 +1,8 @@
+# Python 3.11. Exact versions used to train the model and produce the submission.
+numpy==2.4.6
+pandas==2.3.3
+scipy==1.17.1
+scikit-learn==1.9.1
+joblib==1.6.0
+# Only needed to download the external DFL dataset (train.py, evaluate_external.py).
+floodlight==1.2.0
